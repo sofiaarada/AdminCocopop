@@ -75,7 +75,6 @@ def init_db():
             FOREIGN KEY (venta_id) REFERENCES ventas(id) ON DELETE CASCADE,
             FOREIGN KEY (producto_id) REFERENCES productos(id)
         );
-
         CREATE TABLE IF NOT EXISTS encargos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             id_encargo TEXT NOT NULL,
@@ -111,8 +110,29 @@ def init_db():
             costo_unitario REAL DEFAULT 0,
             costo_total REAL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS caja (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha DATETIME DEFAULT CURRENT_TIMESTAMP,
+            tipo TEXT NOT NULL,
+            categoria TEXT NOT NULL,
+            origen TEXT NOT NULL,
+            id_ref INTEGER,
+            medio_pago TEXT,
+            entrada REAL DEFAULT 0,
+            salida REAL DEFAULT 0,
+            saldo REAL DEFAULT 0,
+            estado TEXT DEFAULT 'Confirmado'
+        );
     """)
     conn.commit()
+    
+    # Comprobar si caja está vacía pero hay ventas
+    caja_count = conn.cursor().execute("SELECT COUNT(*) FROM caja").fetchone()[0]
+    ventas_count = conn.cursor().execute("SELECT COUNT(*) FROM ventas").fetchone()[0]
+    if caja_count == 0 and ventas_count > 0:
+        sync_historico_caja(conn)
+        
     conn.close()
 
 
@@ -177,16 +197,34 @@ def get_insumos(solo_activos=True):
 
 def add_insumo(nombre, unidad, cantidad, costo_unitario, proveedor, punto_pedido=10):
     conn = get_connection()
-    conn.execute(
+    cursor = conn.cursor()
+    cursor.execute(
         "INSERT INTO insumos (nombre, unidad, cantidad, costo_unitario, proveedor, punto_pedido) VALUES (?,?,?,?,?,?)",
         (nombre, unidad, cantidad, costo_unitario, proveedor, punto_pedido))
+    insumo_id = cursor.lastrowid
+    
+    if costo_unitario > 0 and cantidad > 0:
+        cursor.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES ('EGRESO', 'Compra inventario', 'Insumo', ?, 'Transferencia', 0, ?, 'Confirmado')",
+                       (insumo_id, costo_unitario * cantidad))
+    
     conn.commit()
     conn.close()
+    if costo_unitario > 0 and cantidad > 0:
+        recalcular_saldos_caja()
 
 
 def update_insumo_cantidad(insumo_id, cantidad_agregar):
     conn = get_connection()
     conn.execute("UPDATE insumos SET cantidad = cantidad + ? WHERE id = ?", (cantidad_agregar, insumo_id))
+    conn.commit()
+    conn.close()
+
+
+def update_insumo(insumo_id, nombre, unidad, cantidad, costo_unitario, proveedor, punto_pedido):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE insumos SET nombre=?, unidad=?, cantidad=?, costo_unitario=?, proveedor=?, punto_pedido=? WHERE id=?",
+        (nombre, unidad, cantidad, costo_unitario, proveedor, punto_pedido, insumo_id))
     conn.commit()
     conn.close()
 
@@ -212,22 +250,28 @@ def delete_insumo(insumo_id):
 # =============================================
 
 def registrar_venta(items, costo_envio=0, cliente="", tipo="VENTA", metodo_pago="CONTADO",
-                    medio_pago="EFECTIVO", plataforma="", estado="PAGADO", notas=""):
+                    medio_pago="EFECTIVO", plataforma="", estado="PAGADO", notas="", orden=None, pagado_manual=None):
     conn = get_connection()
     cursor = conn.cursor()
     subtotal = sum(item["cantidad"] * item["precio_unitario"] for item in items)
     total = subtotal + costo_envio
-    pagado = total if estado == "PAGADO" else 0
+    
+    if pagado_manual is not None:
+        pagado = pagado_manual
+    else:
+        pagado = total if estado == "PAGADO" else 0
     saldo = total - pagado
 
-    # Get next orden number
-    max_orden = cursor.execute("SELECT COALESCE(MAX(orden), 0) FROM ventas").fetchone()[0]
+    if orden is None:
+        orden = cursor.execute("SELECT COALESCE(MAX(orden), 0) FROM ventas").fetchone()[0] + 1
+    else:
+        cursor.execute("UPDATE ventas SET orden = orden + 1 WHERE orden >= ?", (orden,))
 
     cursor.execute(
         """INSERT INTO ventas (orden, cliente, tipo, metodo_pago, medio_pago, plataforma, estado,
                                subtotal, costo_envio, total, pagado, saldo, notas)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (max_orden + 1, cliente, tipo, metodo_pago, medio_pago, plataforma, estado,
+        (orden, cliente, tipo, metodo_pago, medio_pago, plataforma, estado,
          subtotal, costo_envio, total, pagado, saldo, notas))
     venta_id = cursor.lastrowid
 
@@ -238,9 +282,117 @@ def registrar_venta(items, costo_envio=0, cliente="", tipo="VENTA", metodo_pago=
             (venta_id, item["producto_id"], item["cantidad"], item["precio_unitario"], item_sub))
         cursor.execute("UPDATE productos SET stock = stock - ? WHERE id = ?",
                         (item["cantidad"], item["producto_id"]))
+                        
+    if pagado > 0:
+        cursor.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES ('INGRESO', 'Venta', 'Venta', ?, ?, ?, 0, 'Confirmado')", 
+                       (venta_id, medio_pago, pagado))
+                       
     conn.commit()
     conn.close()
+    recalcular_saldos_caja()
     return venta_id
+
+def update_venta_info(venta_id, cliente, metodo_pago, medio_pago, plataforma, estado, notas, items=None, costo_envio=None, orden=None):
+    conn = get_connection()
+    v = conn.execute("SELECT * FROM ventas WHERE id = ?", (venta_id,)).fetchone()
+    if not v:
+        conn.close()
+        return
+
+    cursor = conn.cursor()
+
+    if orden is not None and orden != v["orden"]:
+        exist = cursor.execute("SELECT id FROM ventas WHERE orden = ?", (orden,)).fetchone()
+        if exist:
+            cursor.execute("UPDATE ventas SET orden = orden + 1 WHERE orden >= ?", (orden,))
+    else:
+        orden = v["orden"]
+
+    if items is not None:
+        detalles_viejos = cursor.execute("SELECT producto_id, cantidad FROM detalle_ventas WHERE venta_id = ?", (venta_id,)).fetchall()
+        for d in detalles_viejos:
+            cursor.execute("UPDATE productos SET stock = stock + ? WHERE id = ?", (d["cantidad"], d["producto_id"]))
+        cursor.execute("DELETE FROM detalle_ventas WHERE venta_id = ?", (venta_id,))
+        
+        subtotal = sum(item["cantidad"] * item["precio_unitario"] for item in items)
+        for item in items:
+            item_sub = item["cantidad"] * item["precio_unitario"]
+            cursor.execute(
+                "INSERT INTO detalle_ventas (venta_id, producto_id, cantidad, precio_unitario, subtotal) VALUES (?,?,?,?,?)",
+                (venta_id, item["producto_id"], item["cantidad"], item["precio_unitario"], item_sub))
+            cursor.execute("UPDATE productos SET stock = stock - ? WHERE id = ?", (item["cantidad"], item["producto_id"]))
+    else:
+        subtotal = v["subtotal"]
+
+    if costo_envio is None:
+        costo_envio = v["costo_envio"]
+
+    total = subtotal + costo_envio
+    pagado = total if estado == "PAGADO" else v["pagado"]
+    saldo = total - pagado
+
+    cursor.execute(
+        """UPDATE ventas SET orden=?, cliente=?, metodo_pago=?, medio_pago=?, plataforma=?, estado=?, subtotal=?, costo_envio=?, total=?, pagado=?, saldo=?, notas=? WHERE id=?""",
+        (orden, cliente, metodo_pago, medio_pago, plataforma, estado, subtotal, costo_envio, total, pagado, saldo, notas, venta_id)
+    )
+
+    cursor.execute("DELETE FROM caja WHERE origen = 'Venta' AND id_ref = ?", (venta_id,))
+    if pagado > 0:
+        cursor.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES ('INGRESO', 'Venta', 'Venta', ?, ?, ?, 0, 'Confirmado')", 
+                       (venta_id, medio_pago, pagado))
+
+    conn.commit()
+    conn.close()
+    recalcular_saldos_caja()
+    
+def delete_venta(venta_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    v = cursor.execute("SELECT orden FROM ventas WHERE id = ?", (venta_id,)).fetchone()
+    orden = v["orden"] if v else None
+    
+    detalles = cursor.execute("SELECT producto_id, cantidad FROM detalle_ventas WHERE venta_id = ?", (venta_id,)).fetchall()
+    for d in detalles:
+        cursor.execute("UPDATE productos SET stock = stock + ? WHERE id = ?", (d["cantidad"], d["producto_id"]))
+    cursor.execute("DELETE FROM ventas WHERE id = ?", (venta_id,))
+    cursor.execute("DELETE FROM caja WHERE origen = 'Venta' AND id_ref = ?", (venta_id,))
+    
+    if orden:
+        cursor.execute("UPDATE ventas SET orden = orden - 1 WHERE orden > ?", (orden,))
+
+    conn.commit()
+    conn.close()
+    recalcular_saldos_caja()
+
+def update_abono_venta(venta_id, nuevo_abono_total):
+    conn = get_connection()
+    v = conn.execute("SELECT * FROM ventas WHERE id = ?", (venta_id,)).fetchone()
+    if not v:
+        conn.close()
+        return
+        
+    total = v["total"]
+    saldo = max(0, total - nuevo_abono_total)
+    estado = "PAGADO" if saldo <= 0 else v["estado"]
+    diferencia = nuevo_abono_total - v["pagado"]
+    
+    conn.execute("UPDATE ventas SET pagado=?, saldo=?, estado=? WHERE id=?", (nuevo_abono_total, saldo, estado, venta_id))
+    
+    if diferencia > 0:
+        conn.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, plataforma, entrada, salida, estado) VALUES ('INGRESO', 'Abono', 'Venta', ?, ?, ?, ?, 0, 'Confirmado')",
+                     (venta_id, v["medio_pago"], v["plataforma"], diferencia))
+                     
+    conn.commit()
+    conn.close()
+    if diferencia > 0:
+        recalcular_saldos_caja()
+
+def descontar_insumos(insumo_nombres):
+    conn = get_connection()
+    for ins in insumo_nombres:
+        conn.execute("UPDATE insumos SET cantidad = MAX(0, cantidad - 1) WHERE nombre = ?", (ins,))
+    conn.commit()
+    conn.close()
 
 
 def get_ventas(limite=50):
@@ -306,20 +458,63 @@ def add_encargo(id_encargo, cliente, producto, cantidad, precio_unitario, abono=
            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         (id_encargo, cliente, producto, cantidad, precio_unitario, total, abono, saldo, estado,
          fecha_entrega, observaciones))
+    enc_id = conn.cursor().lastrowid
+    
+    if abono > 0:
+        conn.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES ('INGRESO', 'Abono cliente', 'Encargo', ?, 'Efectivo', ?, 0, 'Confirmado')",
+                       (enc_id, abono))
+                       
     conn.commit()
     conn.close()
+    if abono > 0:
+        recalcular_saldos_caja()
 
 
 def update_encargo_abono(encargo_id, nuevo_abono):
     conn = get_connection()
-    enc = conn.execute("SELECT total FROM encargos WHERE id = ?", (encargo_id,)).fetchone()
+    enc = conn.execute("SELECT total, abono FROM encargos WHERE id = ?", (encargo_id,)).fetchone()
     if enc:
+        diferencia = nuevo_abono - enc["abono"]
         saldo = enc["total"] - nuevo_abono
         estado = "ENTREGADO" if saldo <= 0 else "SEPARADO"
         conn.execute("UPDATE encargos SET abono=?, saldo=?, estado=? WHERE id=?",
                       (nuevo_abono, max(saldo, 0), estado, encargo_id))
+        if diferencia > 0:
+            conn.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES ('INGRESO', 'Abono cliente', 'Encargo', ?, 'Efectivo', ?, 0, 'Confirmado')",
+                           (encargo_id, diferencia))
     conn.commit()
     conn.close()
+    recalcular_saldos_caja()
+
+
+def update_encargo_estado(encargo_id, estado):
+    conn = get_connection()
+    conn.execute("UPDATE encargos SET estado = ? WHERE id = ?", (estado, encargo_id))
+    conn.commit()
+    conn.close()
+
+
+def update_encargo(encargo_id, id_encargo, cliente, producto, cantidad, precio_unitario, fecha_entrega, observaciones):
+    conn = get_connection()
+    enc = conn.execute("SELECT abono FROM encargos WHERE id = ?", (encargo_id,)).fetchone()
+    abono = enc["abono"] if enc else 0
+    total = cantidad * precio_unitario
+    saldo = total - abono
+    estado = "SEPARADO" if saldo > 0 else "ENTREGADO"
+    conn.execute(
+        "UPDATE encargos SET id_encargo=?, cliente=?, producto=?, cantidad=?, precio_unitario=?, total=?, saldo=?, estado=?, fecha_entrega=?, observaciones=? WHERE id=?",
+        (id_encargo, cliente, producto, cantidad, precio_unitario, total, max(saldo, 0), estado, fecha_entrega, observaciones, encargo_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_encargo(encargo_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM encargos WHERE id = ?", (encargo_id,))
+    conn.execute("DELETE FROM caja WHERE origen = 'Encargo' AND id_ref = ?", (encargo_id,))
+    conn.commit()
+    conn.close()
+    recalcular_saldos_caja()
 
 
 def update_encargo_estado(encargo_id, estado):
@@ -342,10 +537,43 @@ def get_gastos(limite=50):
 
 def add_gasto(tipo, categoria, descripcion, medio, monto):
     conn = get_connection()
-    conn.execute("INSERT INTO gastos (tipo, categoria, descripcion, medio, monto) VALUES (?,?,?,?,?)",
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO gastos (tipo, categoria, descripcion, medio, monto) VALUES (?,?,?,?,?)",
                   (tipo, categoria, descripcion, medio, monto))
+    gasto_id = cursor.lastrowid
+    
+    cat_caja = "Gastos varios"
+    if categoria.lower() == "envío" or categoria.lower() == "envio": cat_caja = "Envío"
+    elif categoria.lower() == "empaque": cat_caja = "Empaque"
+    
+    cursor.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES ('EGRESO', ?, 'Gasto', ?, ?, 0, ?, 'Confirmado')",
+                   (cat_caja, gasto_id, medio, monto))
     conn.commit()
     conn.close()
+    recalcular_saldos_caja()
+
+
+def update_gasto(gasto_id, tipo, categoria, descripcion, medio, monto):
+    conn = get_connection()
+    conn.execute("UPDATE gastos SET tipo=?, categoria=?, descripcion=?, medio=?, monto=? WHERE id=?",
+                 (tipo, categoria, descripcion, medio, monto, gasto_id))
+    cat_caja = "Gastos varios"
+    if categoria.lower() == "envío" or categoria.lower() == "envio": cat_caja = "Envío"
+    elif categoria.lower() == "empaque": cat_caja = "Empaque"
+    conn.execute("UPDATE caja SET categoria=?, medio_pago=?, salida=? WHERE origen='Gasto' AND id_ref=?",
+                 (cat_caja, medio, monto, gasto_id))
+    conn.commit()
+    conn.close()
+    recalcular_saldos_caja()
+
+
+def delete_gasto(gasto_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM gastos WHERE id = ?", (gasto_id,))
+    conn.execute("DELETE FROM caja WHERE origen = 'Gasto' AND id_ref = ?", (gasto_id,))
+    conn.commit()
+    conn.close()
+    recalcular_saldos_caja()
 
 
 # =============================================
@@ -359,11 +587,27 @@ def get_compras(limite=100):
     return [dict(r) for r in rows]
 
 
-def add_compra(proveedor, producto, cantidad, costo_unitario):
+def add_compra(fecha, proveedor, producto, cantidad, costo_unitario):
     conn = get_connection()
     conn.execute(
-        "INSERT INTO compras (proveedor, producto, cantidad, costo_unitario, costo_total) VALUES (?,?,?,?,?)",
-        (proveedor, producto, cantidad, costo_unitario, cantidad * costo_unitario))
+        "INSERT INTO compras (fecha, proveedor, producto, cantidad, costo_unitario, costo_total) VALUES (?,?,?,?,?,?)",
+        (fecha, proveedor, producto, cantidad, costo_unitario, cantidad * costo_unitario))
+    conn.commit()
+    conn.close()
+
+
+def update_compra(compra_id, fecha, proveedor, producto, cantidad, costo_unitario):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE compras SET fecha=?, proveedor=?, producto=?, cantidad=?, costo_unitario=?, costo_total=? WHERE id=?",
+        (fecha, proveedor, producto, cantidad, costo_unitario, cantidad * costo_unitario, compra_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_compra(compra_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM compras WHERE id = ?", (compra_id,))
     conn.commit()
     conn.close()
 
@@ -572,5 +816,112 @@ def cargar_datos_demo():
             "INSERT INTO insumos (nombre, unidad, cantidad, costo_unitario, proveedor, punto_pedido) VALUES (?,?,?,?,?,?)", ins)
 
     conn.commit()
+    
+    # === SYNC CAJA HISTORICA ===
+    sync_historico_caja(conn)
+    
     conn.close()
     return True
+
+    conn.close()
+    return True
+
+
+# =============================================
+#  CRUD — CAJA
+# =============================================
+
+def get_caja():
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM caja ORDER BY fecha DESC, id DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def recalcular_saldos_caja():
+    """Recalcula el saldo acumulativo de la caja"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    rows = cursor.execute("SELECT id, entrada, salida FROM caja ORDER BY fecha ASC, id ASC").fetchall()
+    saldo = 0.0
+    for r in rows:
+        saldo += (r["entrada"] - r["salida"])
+        cursor.execute("UPDATE caja SET saldo = ? WHERE id = ?", (saldo, r["id"]))
+    conn.commit()
+    conn.close()
+
+def add_movimiento_caja(fecha, tipo, categoria, origen, medio_pago, entrada, salida, estado='Confirmado'):
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO caja (fecha, tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+        (fecha, tipo, categoria, origen, medio_pago, entrada, salida, estado)
+    )
+    conn.commit()
+    conn.close()
+    recalcular_saldos_caja()
+
+def update_movimiento_caja(caja_id, fecha, tipo, categoria, medio_pago, entrada, salida, estado):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE caja SET fecha=?, tipo=?, categoria=?, medio_pago=?, entrada=?, salida=?, estado=? WHERE id=?",
+        (fecha, tipo, categoria, medio_pago, entrada, salida, estado, caja_id)
+    )
+    conn.commit()
+    conn.close()
+    recalcular_saldos_caja()
+
+def delete_movimiento_caja(caja_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM caja WHERE id = ?", (caja_id,))
+    conn.commit()
+    conn.close()
+    recalcular_saldos_caja()
+
+
+def sync_historico_caja(conn):
+    """Sincroniza todos los movimientos preexistentes a la nueva tabla de caja."""
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM caja")
+    
+    # 1. Ventas
+    ventas = cursor.execute("SELECT id, fecha, medio_pago, pagado FROM ventas WHERE pagado > 0").fetchall()
+    for v in ventas:
+        cursor.execute("INSERT INTO caja (fecha, tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES (?, 'INGRESO', 'Venta', 'Venta', ?, ?, ?, 0, 'Confirmado')", 
+                       (v["fecha"], v["id"], v["medio_pago"], v["pagado"]))
+        
+    # 2. Encargos (Abonos)
+    encargos = cursor.execute("SELECT id, fecha, abono FROM encargos WHERE abono > 0").fetchall()
+    for e in encargos:
+        cursor.execute("INSERT INTO caja (fecha, tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES (?, 'INGRESO', 'Abono cliente', 'Encargo', ?, 'Efectivo', ?, 0, 'Confirmado')",
+                       (e["fecha"], e["id"], e["abono"]))
+        
+    # 3. Gastos
+    gastos = cursor.execute("SELECT id, fecha, categoria, medio, monto FROM gastos WHERE monto > 0").fetchall()
+    for g in gastos:
+        cat = "Gastos varios"
+        if g["categoria"].lower() == "envio": cat = "Envío"
+        elif g["categoria"].lower() == "empaque": cat = "Empaque"
+        cursor.execute("INSERT INTO caja (fecha, tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES (?, 'EGRESO', ?, 'Gasto', ?, ?, 0, ?, 'Confirmado')",
+                       (g["fecha"], cat, g["id"], g["medio"], g["monto"]))
+        
+    # 4. Compras
+    compras = cursor.execute("SELECT id, fecha, costo_total FROM compras WHERE costo_total > 0").fetchall()
+    for c in compras:
+        cursor.execute("INSERT INTO caja (fecha, tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES (?, 'EGRESO', 'Compra inventario', 'Compra', ?, 'Transferencia', 0, ?, 'Confirmado')",
+                       (c["fecha"], c["id"], c["costo_total"]))
+        
+    # 5. Insumos
+    insumos = cursor.execute("SELECT id, costo_unitario, cantidad, fecha_creacion FROM insumos WHERE costo_unitario > 0 AND cantidad > 0").fetchall()
+    for i in insumos:
+        cursor.execute("INSERT INTO caja (fecha, tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES (?, 'EGRESO', 'Compra inventario', 'Insumo', ?, 'Transferencia', 0, ?, 'Confirmado')",
+                       (i["fecha_creacion"], i["id"], i["costo_unitario"] * i["cantidad"]))
+                       
+    conn.commit()
+    
+    # Recalcular saldos
+    rows = cursor.execute("SELECT id, entrada, salida FROM caja ORDER BY fecha ASC, id ASC").fetchall()
+    saldo = 0.0
+    for r in rows:
+        saldo += (r["entrada"] - r["salida"])
+        cursor.execute("UPDATE caja SET saldo = ? WHERE id = ?", (saldo, r["id"]))
+    
+    conn.commit()

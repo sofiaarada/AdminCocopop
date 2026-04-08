@@ -13,7 +13,7 @@ def get_dataframe_ventas():
     if not datos:
         return pd.DataFrame()
     df = pd.DataFrame(datos)
-    df["fecha"] = pd.to_datetime(df["fecha"])
+    df["fecha"] = pd.to_datetime(df["fecha"], format='mixed', errors='coerce')
     return df
 
 
@@ -29,7 +29,7 @@ def get_dataframe_ventas_resumen():
     if not ventas:
         return pd.DataFrame()
     df = pd.DataFrame(ventas)
-    df["fecha"] = pd.to_datetime(df["fecha"])
+    df["fecha"] = pd.to_datetime(df["fecha"], format='mixed', errors='coerce')
     return df
 
 
@@ -45,6 +45,15 @@ def get_dataframe_gastos():
     if not gastos:
         return pd.DataFrame()
     return pd.DataFrame(gastos)
+
+
+def get_dataframe_caja():
+    caja = db.get_caja()
+    if not caja:
+        return pd.DataFrame()
+    df = pd.DataFrame(caja)
+    df["fecha_dt"] = pd.to_datetime(df["fecha"], format='mixed', errors='coerce')
+    return df
 
 
 # =============================================
@@ -68,28 +77,38 @@ def calcular_kpis(periodo_dias=30):
 
     fecha_corte = datetime.now() - timedelta(days=periodo_dias)
 
-    total_ventas = len(df_ventas)
-    ventas_totales_monto = df_ventas["total"].sum()
+    # Ventas reales (excluyendo encargos para el total bruto)
+    df_ventas_reales = df_ventas[df_ventas["tipo"] == "VENTA"]
+    df_encargos_v = df_ventas[df_ventas["tipo"].isin(["ENCARGO", "SEPARADO"])]
+    
+    total_ventas = len(df_ventas_reales)
+    ventas_totales_monto = df_ventas_reales["total"].sum() + df_encargos_v["pagado"].sum()
     costo_envio_total = df_ventas["costo_envio"].sum()
-    ticket_promedio = df_ventas["total"].mean()
+    ticket_promedio = df_ventas_reales["total"].mean() if not df_ventas_reales.empty else 0
     productos_vendidos = df["cantidad"].sum() if not df.empty else 0
 
-    # Recibido vs Por cobrar (como en LISTAS de INVGASGAN)
-    recibido = df_ventas[df_ventas["estado"] == "PAGADO"]["total"].sum()
-    por_cobrar = df_ventas[df_ventas["estado"] == "PENDIENTE"]["total"].sum()
+    # Recibido vs Por cobrar
+    # Recibido: Todo lo pagado (Ventas + Abonos de Encargos)
+    recibido = df_ventas["pagado"].sum()
+    # Por cobrar: Solo lo pendiente de Ventas Reales (usualmente 0 si es CONTADO, o saldo si es CREDITO)
+    por_cobrar = df_ventas_reales["saldo"].sum()
 
     # Stock bajo
     productos_bajo_stock = 0
     if not df_productos.empty:
         productos_bajo_stock = len(df_productos[df_productos["stock"] <= df_productos["punto_pedido"]])
 
-    # Encargos
+    # Encargos (de la tabla independiente y de la tabla ventas tipo encargo)
     encargos_pendientes = 0
     saldo_encargos = 0
     if not df_encargos.empty:
         sep = df_encargos[df_encargos["estado"] == "SEPARADO"]
         encargos_pendientes = len(sep)
         saldo_encargos = sep["saldo"].sum() if not sep.empty else 0
+        
+    # Sumar saldos de encargos que están en la tabla ventas
+    saldo_encargos += df_encargos_v["saldo"].sum()
+    encargos_pendientes += len(df_encargos_v[df_encargos_v["estado"] != "ENTREGADO"])
 
     # Gastos
     total_gastos = df_gastos["monto"].sum() if not df_gastos.empty else 0
@@ -98,16 +117,19 @@ def calcular_kpis(periodo_dias=30):
     ganancia_total = 0
     if not df.empty and not df_productos.empty:
         prods = df_productos.set_index("id")
+        # Filtrar detalles de ventas que no sean encargos pendientes (opcional, pero ganancia se suele contar al vender)
         for _, row in df.iterrows():
             pid = row["producto_id"]
             if pid in prods.index:
                 costo = prods.loc[pid, "costo"]
+                # Solo contamos ganancia de ventas reales o encargos ya pagados/entregados?
+                # Por ahora, ganancia sobre unidades que salieron de stock.
                 ganancia_total += (row["precio_unitario"] - costo) * row["cantidad"]
 
     # Período
-    df_per = df_ventas[df_ventas["fecha"] >= fecha_corte]
+    df_per = df_ventas_reales[df_ventas_reales["fecha"] >= fecha_corte]
     ventas_periodo = len(df_per)
-    ingresos_periodo = df_per["total"].sum() if not df_per.empty else 0
+    ingresos_periodo = df_per["pagado"].sum() + df_encargos_v[df_encargos_v["fecha"] >= fecha_corte]["pagado"].sum()
 
     return {
         "total_ventas": int(total_ventas),
@@ -249,6 +271,46 @@ def calcular_punto_pedido(dias_analisis=28, tiempo_entrega_dias=7, factor_seguri
     return pd.DataFrame(resultados)
 
 
+def calcular_analisis_costos(costo_fijo_adicional=3500):
+    """Calcula la rentabilidad detallada por producto."""
+    df_prod = get_dataframe_productos()
+    if df_prod.empty:
+        return pd.DataFrame()
+    
+    resultados = []
+    for _, p in df_prod.iterrows():
+        p_compra = p["costo"]
+        p_venta = p["precio_venta"]
+        
+        # Operación: Venta - (Compra + Gastos fijos por unidad)
+        utilidad_bruta = p_venta - (p_compra + costo_fijo_adicional)
+        
+        # Margen = (Utilidad / Venta) * 100
+        margen = (utilidad_bruta / p_venta * 100) if p_venta > 0 else 0
+        
+        if margen < 40:
+            estado = "🔴 Critico (<40%)"
+        elif margen < 55:
+            estado = "🟡 Ajustado (40-55%)"
+        else:
+            estado = "🟢 Saludable (>55%)"
+            
+        resultados.append({
+            "id": p["id"],
+            "Referencia": p["referencia"],
+            "Costo Compra": round(p_compra),
+            "Gastos Env/Emp": round(costo_fijo_adicional),
+            "Costo Total": round(p_compra + costo_fijo_adicional),
+            "Precio Venta": round(p_venta),
+            "Utilidad": round(utilidad_bruta),
+            "Margen %": f"{round(margen)}%",
+            "Estado": estado,
+            "categoria": p["categoria"]
+        })
+        
+    return pd.DataFrame(resultados)
+
+
 # =============================================
 #  AGRUPACIONES
 # =============================================
@@ -317,3 +379,101 @@ def resumen_gastos():
     return (df.groupby("categoria")
             .agg(total=("monto", "sum"), num=("id", "count"))
             .reset_index().sort_values("total", ascending=False))
+
+# =============================================
+#  BUSINESS INTELLIGENCE (NUEVO)
+# =============================================
+
+def rentabilidad_real(dias=30):
+    df_caja = get_dataframe_caja()
+    if df_caja.empty:
+        return {"ingresos": 0, "egresos": 0, "margen": 0}
+        
+    fecha_corte = datetime.now() - timedelta(days=dias)
+    df = df_caja[df_caja["fecha_dt"] >= fecha_corte]
+    
+    ingresos = df["entrada"].sum()
+    egresos = df["salida"].sum()
+    margen = ((ingresos - egresos) / ingresos) if ingresos > 0 else 0
+    return {"ingresos": ingresos, "egresos": egresos, "margen": margen}
+
+def costo_adquisicion(dias=30):
+    df_caja = get_dataframe_caja()
+    if df_caja.empty:
+        return {"gastos_adquisicion": 0, "ingresos_ventas": 0}
+        
+    fecha_corte = datetime.now() - timedelta(days=dias)
+    df = df_caja[df_caja["fecha_dt"] >= fecha_corte]
+    
+    # Gastos en publicidad y empaque vs Ventas
+    gastos = df[(df["tipo"] == "EGRESO") & df["categoria"].isin(["Publicidad", "Empaque"])]["salida"].sum()
+    ventas = df[(df["tipo"] == "INGRESO") & (df["categoria"] == "Venta")]["entrada"].sum()
+    return {"gastos_adquisicion": gastos, "ingresos_ventas": ventas}
+
+def stock_muerto(dias=30):
+    df_ventas = get_dataframe_ventas()
+    df_prods = get_dataframe_productos()
+    
+    if df_prods.empty: return []
+    
+    fecha_corte = datetime.now() - timedelta(days=dias)
+    
+    if not df_ventas.empty:
+        ventas_recientes = df_ventas[df_ventas["fecha"] >= fecha_corte]["producto_id"].unique()
+    else:
+        ventas_recientes = []
+        
+    # Productos que tienen stock pero no ventas recientes
+    muertos = df_prods[(df_prods["stock"] > 0) & (~df_prods["id"].isin(ventas_recientes))]
+    return muertos[["referencia", "categoria", "stock"]].to_dict("records")
+
+def flujo_caja(dias=30):
+    df_caja = get_dataframe_caja()
+    if df_caja.empty: return pd.DataFrame()
+    
+    fecha_corte = datetime.now() - timedelta(days=dias)
+    df = df_caja[df_caja["fecha_dt"] >= fecha_corte].copy()
+    
+    if df.empty: return pd.DataFrame()
+    
+    df["dia"] = df["fecha_dt"].dt.date
+    # Tomar el último saldo del día
+    diario = df.groupby("dia").last().reset_index()[["dia", "saldo"]]
+    return diario
+
+def egresos_por_categoria(dias=30):
+    df_caja = get_dataframe_caja()
+    if df_caja.empty: return pd.DataFrame()
+    
+    fecha_corte = datetime.now() - timedelta(days=dias)
+    df = df_caja[(df_caja["fecha_dt"] >= fecha_corte) & (df_caja["tipo"] == "EGRESO")].copy()
+    
+    if df.empty: return pd.DataFrame(columns=["categoria", "salida"])
+    
+    return df.groupby("categoria")["salida"].sum().reset_index().sort_values("salida", ascending=False)
+
+def generar_ia_insight():
+    rr = rentabilidad_real(30)
+    ca = costo_adquisicion(30)
+    muertos = stock_muerto(30)
+    
+    insights = []
+    
+    if rr["margen"] < 0.2:
+        insights.append("Tus márgenes de rentabilidad están en el límite inferior (<20%). Sugiero enfocar promociones en los productos con mayor ganancia unitaria.")
+    elif rr["margen"] > 0.4:
+        insights.append("¡Excelente margen neto de este mes! Tienes holgura para realizar campañas de descuento si deseas rotar inventario.")
+        
+    if ca["ingresos_ventas"] > 0:
+        ratio = ca["gastos_adquisicion"] / ca["ingresos_ventas"]
+        if ratio > 0.15:
+            insights.append("Tus gastos en empaque/publicidad representan más del 15% de tus ventas. Podría valer la pena renegociar con proveedores.")
+            
+    if len(muertos) > 5:
+        insights.append(f"Tienes {len(muertos)} productos en stock que no han tenido movimiento en 30 días. Una campaña flash de liquidación mejoraría tu liquidez.")
+        
+    if not insights:
+        insights.append("El negocio presenta estabilidad general. Continúa monitoreando tu flujo de caja en el módulo de '🧮 Caja'.")
+        
+    import random
+    return random.choice(insights)
