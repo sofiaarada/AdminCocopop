@@ -305,7 +305,8 @@ def calcular_analisis_costos(costo_fijo_adicional=3500):
             "Utilidad": round(utilidad_bruta),
             "Margen %": f"{round(margen)}%",
             "Estado": estado,
-            "categoria": p["categoria"]
+            "categoria": p["categoria"],
+            "imagen": p.get("imagen") if "imagen" in p else None
         })
         
     return pd.DataFrame(resultados)

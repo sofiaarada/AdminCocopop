@@ -32,6 +32,7 @@ def init_db():
             stock INTEGER DEFAULT 0,
             punto_pedido INTEGER DEFAULT 2,
             activo INTEGER DEFAULT 1,
+            imagen TEXT,
             fecha_creacion DATETIME DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -139,6 +140,7 @@ def init_db():
     
     # Migrate existing encargos table to add producto_id if missing
     _migrate_encargos(conn)
+    _migrate_productos_imagen(conn)
     
     # Comprobar si caja está vacía pero hay ventas
     caja_count = conn.cursor().execute("SELECT COUNT(*) FROM caja").fetchone()[0]
@@ -176,6 +178,14 @@ def _migrate_encargos(conn):
 #  CRUD — PRODUCTOS
 # =============================================
 
+def _migrate_productos_imagen(conn):
+    """Migra tabla productos: agrega columna imagen si no existe."""
+    cursor = conn.cursor()
+    cols = [row[1] for row in cursor.execute("PRAGMA table_info(productos)").fetchall()]
+    if "imagen" not in cols:
+        cursor.execute("ALTER TABLE productos ADD COLUMN imagen TEXT")
+        conn.commit()
+
 def get_productos(solo_activos=True):
     conn = get_connection()
     q = "SELECT * FROM productos"
@@ -187,23 +197,23 @@ def get_productos(solo_activos=True):
     return [dict(r) for r in rows]
 
 
-def add_producto(categoria, referencia, unidad_medida, precio_venta, costo, stock=0, punto_pedido=2):
+def add_producto(categoria, referencia, unidad_medida, precio_venta, costo, stock=0, punto_pedido=2, imagen=None):
     conn = get_connection()
     conn.execute(
-        """INSERT INTO productos (categoria, referencia, unidad_medida, precio_venta, costo, stock, punto_pedido)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (categoria, referencia, unidad_medida, precio_venta, costo, stock, punto_pedido)
+        """INSERT INTO productos (categoria, referencia, unidad_medida, precio_venta, costo, stock, punto_pedido, imagen)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (categoria, referencia, unidad_medida, precio_venta, costo, stock, punto_pedido, imagen)
     )
     conn.commit()
     conn.close()
 
 
-def update_producto(producto_id, categoria, referencia, unidad_medida, precio_venta, costo, stock, punto_pedido):
+def update_producto(producto_id, categoria, referencia, unidad_medida, precio_venta, costo, stock, punto_pedido, imagen=None):
     conn = get_connection()
     conn.execute(
         """UPDATE productos SET categoria=?, referencia=?, unidad_medida=?, precio_venta=?,
-           costo=?, stock=?, punto_pedido=? WHERE id=?""",
-        (categoria, referencia, unidad_medida, precio_venta, costo, stock, punto_pedido, producto_id)
+           costo=?, stock=?, punto_pedido=?, imagen=? WHERE id=?""",
+        (categoria, referencia, unidad_medida, precio_venta, costo, stock, punto_pedido, imagen, producto_id)
     )
     conn.commit()
     conn.close()

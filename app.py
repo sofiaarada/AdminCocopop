@@ -8,6 +8,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
+import base64
 
 import database as db
 import analytics as an
@@ -633,9 +634,15 @@ elif pagina == "💎 Productos":
             cat_f = st.selectbox("Filtrar categoría", cats)
             dff = df if cat_f == "Todas" else df[df["categoria"] == cat_f]
 
-            st.dataframe(dff[["id", "categoria", "referencia", "unidad_medida", "precio_venta", "costo", "stock"]].rename(
-                columns={"id": "ID", "categoria": "Categoría", "referencia": "Referencia", "unidad_medida": "Unidad",
-                          "precio_venta": "Precio Venta", "costo": "Precio de Compra", "stock": "Stock"}),
+            cols_to_show = ["id", "categoria", "referencia", "unidad_medida", "precio_venta", "costo", "stock"]
+            if "imagen" in dff.columns:
+                cols_to_show.insert(1, "imagen")
+                
+            rename_dict = {"id": "ID", "imagen": "Foto", "categoria": "Categoría", "referencia": "Referencia", "unidad_medida": "Unidad",
+                          "precio_venta": "Precio Venta", "costo": "Precio de Compra", "stock": "Stock"}
+
+            st.dataframe(dff[cols_to_show].rename(columns=rename_dict),
+                column_config={"Foto": st.column_config.ImageColumn("Foto")},
                 use_container_width=True, hide_index=True)
 
             with st.form("f_stock"):
@@ -660,9 +667,14 @@ elif pagina == "💎 Productos":
                 pv = st.number_input("Precio Venta ($)", min_value=0, step=500)
                 cost = st.number_input("Precio de Compra ($)", min_value=0, step=500)
             stk = st.number_input("Stock", min_value=0, value=1)
+            img_file = st.file_uploader("Foto del Producto", type=["png", "jpg", "jpeg"])
+            
             if st.form_submit_button("💾 Guardar", use_container_width=True):
                 if ref and pv > 0:
-                    db.add_producto(cat, ref, uni, pv, cost, stk)
+                    img_base64 = None
+                    if img_file is not None:
+                        img_base64 = "data:image/" + img_file.name.split('.')[-1] + ";base64," + base64.b64encode(img_file.read()).decode()
+                    db.add_producto(cat, ref, uni, pv, cost, stk, imagen=img_base64)
                     st.success(f"✅ '{ref}' agregado"); st.rerun()
 
     prods_all = db.get_productos()
@@ -670,6 +682,10 @@ elif pagina == "💎 Productos":
         with st.expander("✏️ Editar Producto"):
             p_id_edit = st.selectbox("Seleccionar Producto a Editar", [p["id"] for p in prods_all], format_func=lambda x: f"{next((p['referencia'] for p in prods_all if p['id']==x), '')}", key="edit_prod")
             prod_sel = next(p for p in prods_all if p["id"] == p_id_edit)
+            
+            if prod_sel.get("imagen"):
+                st.image(prod_sel["imagen"], width=150)
+                
             with st.form("f_edit_prod"):
                 ref_e = st.text_input("Referencia", value=prod_sel["referencia"])
                 c1_e, c2_e = st.columns(2)
@@ -685,8 +701,12 @@ elif pagina == "💎 Productos":
                     cost_e = st.number_input("Precio de Compra ($)", min_value=0, step=500, value=int(prod_sel["costo"]))
                 stk_e = st.number_input("Stock", min_value=0, value=int(prod_sel["stock"]))
                 pp_e = st.number_input("Punto Pedido", min_value=0, value=int(prod_sel["punto_pedido"]))
+                img_file_e = st.file_uploader("Nueva Foto (opcional)", type=["png", "jpg", "jpeg"])
                 if st.form_submit_button("Actualizar Producto"):
-                    db.update_producto(p_id_edit, cat_e, ref_e, uni_e, pv_e, cost_e, stk_e, pp_e)
+                    img_base64_e = prod_sel.get("imagen")
+                    if img_file_e is not None:
+                        img_base64_e = "data:image/" + img_file_e.name.split('.')[-1] + ";base64," + base64.b64encode(img_file_e.read()).decode()
+                    db.update_producto(p_id_edit, cat_e, ref_e, uni_e, pv_e, cost_e, stk_e, pp_e, imagen=img_base64_e)
                     st.success("✅ Producto actualizado"); st.rerun()
                     
         with st.expander("🗑️ Eliminar Producto"):
@@ -703,11 +723,19 @@ elif pagina == "💎 Productos":
         df_costs = an.calcular_analisis_costos(envio_empaque_base)
         
         if not df_costs.empty:
+            # Reordenar las columnas para mostrar 'imagen' si existe
+            cols_to_show_costs = list(df_costs.columns)
+            if "imagen" in cols_to_show_costs:
+                cols_to_show_costs.remove("imagen")
+                cols_to_show_costs.insert(2, "imagen")
+                df_costs = df_costs[cols_to_show_costs]
+
             # Editable table for basic fields
             edited_df = st.data_editor(df_costs, 
                 column_config={
                     "id": None, 
                     "categoria": None,
+                    "imagen": st.column_config.ImageColumn("Foto"),
                     "Referencia": st.column_config.TextColumn("Referencia", disabled=True),
                     "Costo Compra": st.column_config.NumberColumn("Costo Compra ($)", min_value=0, step=500),
                     "Gastos Env/Emp": st.column_config.NumberColumn("Gastos Env/Emp", disabled=True),
