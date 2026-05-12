@@ -69,7 +69,7 @@ with st.sidebar:
     </div>""", unsafe_allow_html=True)
     st.markdown("---")
     pagina = st.radio("Nav", ["📊 Dashboard", "🛒 Registrar Venta", "📋 Encargos", "🛍️ Compras", "📦 Insumos",
-                               "💎 Productos", "💰 Gastos", "📈 Ganancia", "🧠 Análisis Inteligente", "🧮 Caja"],
+                               "💎 Productos", "💰 Gastos", "📈 Ganancia", "🧠 Análisis Inteligente", "🧮 Caja", "🔧 Health Check"],
                        label_visibility="collapsed")
     st.markdown("---")
     st.markdown('<div style="text-align:center; font-size:0.7rem; opacity:0.5;">Cocopop v3.0 · 💛</div>',
@@ -379,76 +379,108 @@ elif pagina == "🛒 Registrar Venta":
 # ══════════════════════════════════════════
 elif pagina == "📋 Encargos":
     st.markdown("""<div class="main-header"><h1>📋 Gestión de <span class="accent">Encargos</span></h1>
-        <p>Pedidos personalizados · Abonos y Saldos</p></div>""", unsafe_allow_html=True)
+        <p>Pedidos personalizados · Abonos y Saldos · Integridad por ID de producto</p></div>""", unsafe_allow_html=True)
 
-    st.info("💡 **Nota:** Esta pestaña es para el seguimiento y gestión manual de encargos personalizados.")
+    st.info("💡 **Nota:** Los encargos usan el ID del producto para mantener integridad. Si un producto cambia de nombre, el encargo siempre mostrará el nombre correcto.")
     
-    vr = db.get_ventas(500)
-    encargos = [v for v in vr if v["tipo"] in ["ENCARGO", "SEPARADO"]]
+    encargos = db.get_encargos_con_producto()
     
     if encargos:
-        detalles_all = db.get_ventas_detalladas()
-        for v in encargos:
-            prods = [f"{d['cantidad']}x {d['producto_nombre']}" for d in detalles_all if d["venta_id"] == v["id"]]
-            v["producto"] = ", ".join(prods)
-            
         df = pd.DataFrame(encargos)
         sep = df[df["estado"] != "ENTREGADO"]
         c1, c2, c3 = st.columns(3)
         with c1: st.metric("Pendientes / Separados", len(sep))
         with c2: st.metric("Por Cobrar", fmt(sep["saldo"].sum()) if not sep.empty else "$0")
-        with c3: st.metric("Abonado Total", fmt(df["pagado"].sum()))
+        with c3: st.metric("Abonado Total", fmt(df["abono"].sum()))
 
-        df["fecha"] = pd.to_datetime(df["fecha"], format='mixed', errors='coerce').dt.strftime("%d/%m/%Y")
-        st.dataframe(df[["id", "fecha", "cliente", "producto", "estado", "total", "pagado", "saldo", "notas"]].rename(
-            columns={"id": "ID", "fecha": "Fecha", "cliente": "Cliente", "producto": "Producto(s)",
-                      "estado": "Estado", "total": "Total", "pagado": "Abono", "saldo": "Saldo", "notas": "Detalles"}),
+        df_show = df.copy()
+        df_show["fecha"] = pd.to_datetime(df_show["fecha"], format='mixed', errors='coerce').dt.strftime("%d/%m/%Y")
+        st.dataframe(df_show[["id", "id_encargo", "fecha", "cliente", "producto_nombre", "estado", "total", "abono", "saldo", "observaciones"]].rename(
+            columns={"id": "ID", "id_encargo": "Ref", "fecha": "Fecha", "cliente": "Cliente", "producto_nombre": "Producto",
+                      "estado": "Estado", "total": "Total", "abono": "Abono", "saldo": "Saldo", "observaciones": "Notas"}),
             use_container_width=True, hide_index=True)
 
         pend = [e for e in encargos if e["estado"] in ["PENDIENTE", "SEPARADO"]]
         if pend:
             st.markdown('<div class="section-header">💵 Registrar Abono o Entrega</div>', unsafe_allow_html=True)
             with st.form("f_abono_encargo"):
-                ops = [f"#{e['id']} — {e['cliente']} — Saldo: ${e['saldo']:,.0f}" for e in pend]
+                ops = [f"#{e['id']} — {e['cliente']} — {e['producto_nombre']} — Saldo: ${e['saldo']:,.0f}" for e in pend]
                 sel = st.selectbox("Encargo", ops)
-                ab = st.number_input("Adicionar Abono ($)", min_value=0, step=1000, help="Este valor se sumará a lo que ya está pagado")
+                ab = st.number_input("Adicionar Abono ($)", min_value=0, step=1000, help="Este valor se sumará al abono existente")
                 if st.form_submit_button("💵 Registrar Abono", use_container_width=True):
-                    enc_id = pend[ops.index(sel)]["id"]
-                    nuevo_abo_total = pend[ops.index(sel)]["pagado"] + ab
-                    db.update_abono_venta(enc_id, nuevo_abo_total)
+                    enc_obj = pend[ops.index(sel)]
+                    nuevo_abo_total = enc_obj["abono"] + ab
+                    db.update_encargo_abono(enc_obj["id"], nuevo_abo_total)
                     st.success(f"✅ Abono registrado sumando ${ab:,.0f}"); st.rerun()
 
             with st.form("f_entregar_encargo"):
-                ops2 = [f"#{e['id']} — {e['cliente']} (Estado actual: {e['estado']})" for e in pend]
+                ops2 = [f"#{e['id']} — {e['cliente']} — {e['producto_nombre']} (Estado: {e['estado']})" for e in pend]
                 sel2 = st.selectbox("Encargo a entregar (Cambia estado a ENTREGADO)", ops2)
                 if st.form_submit_button("✅ Marcar como Entregado", use_container_width=True):
                     e_obj = pend[ops2.index(sel2)]
-                    db.update_venta_info(e_obj["id"], e_obj["cliente"], e_obj["metodo_pago"], e_obj["medio_pago"], e_obj["plataforma"], "ENTREGADO", e_obj["notas"], orden=e_obj["orden"], costo_envio=e_obj["costo_envio"])
+                    db.update_encargo_estado(e_obj["id"], "ENTREGADO")
                     st.success("✅ Encargo Entregado registrado"); st.rerun()
     else:
         st.info("Sin encargos registrados.")
 
     with st.expander("➕ Crear Nuevo Encargo"):
+        productos_cat = db.get_productos()
         with st.form("f_nuevo_encargo", clear_on_submit=True):
             col1, col2 = st.columns(2)
             with col1:
                 id_enc = st.text_input("ID Encargo (Ref)", placeholder="Ej: 150-EN")
                 cli = st.text_input("Cliente *")
-                prod = st.text_input("Producto(s) *")
+                # Selector de producto del catálogo + opción personalizada
+                usar_catalogo = st.checkbox("Seleccionar del catálogo", value=True)
             with col2:
                 cant = st.number_input("Cantidad", min_value=1, value=1)
                 prec = st.number_input("Precio Unitario ($)", min_value=0, step=1000)
                 abo = st.number_input("Abono Inicial ($)", min_value=0, step=1000)
             
+            if usar_catalogo and productos_cat:
+                nombres_prod = [f"{p['referencia']} ({p['categoria']})" for p in productos_cat]
+                prod_sel = st.selectbox("Producto del catálogo", nombres_prod)
+                idx_prod = nombres_prod.index(prod_sel)
+                prod_id_sel = productos_cat[idx_prod]["id"]
+                prod_nombre = productos_cat[idx_prod]["referencia"]
+            else:
+                prod_nombre = st.text_input("Producto (texto libre) *")
+                prod_id_sel = None
+            
             fe = st.text_input("Fecha Entrega", placeholder="Ej: Próximo lunes")
             obs = st.text_area("Observaciones")
             
             if st.form_submit_button("💾 Guardar Encargo", use_container_width=True):
-                if cli and prod:
-                    db.add_encargo(id_enc, cli, prod, cant, prec, abo, fe, obs)
+                if cli and prod_nombre:
+                    db.add_encargo(id_enc, cli, prod_nombre, cant, prec, abo, fe, obs, producto_id=prod_id_sel)
                     st.success("✅ Encargo guardado exitosamente"); st.rerun()
                 else:
                     st.error("⚠️ Cliente y Producto son obligatorios")
+
+    if encargos:
+        with st.expander("✏️ Editar Encargo"):
+            enc_id_edit = st.selectbox("Seleccionar Encargo", [e["id"] for e in encargos], format_func=lambda x: f"#{x} — {next((e['cliente'] for e in encargos if e['id']==x), '')} — {next((e['producto_nombre'] for e in encargos if e['id']==x), '')}")
+            enc_sel = next(e for e in encargos if e["id"] == enc_id_edit)
+            with st.form("f_edit_encargo"):
+                c1e, c2e = st.columns(2)
+                with c1e:
+                    id_enc_e = st.text_input("Ref", value=enc_sel["id_encargo"])
+                    cli_e = st.text_input("Cliente", value=enc_sel["cliente"])
+                    prod_e = st.text_input("Producto", value=enc_sel["producto_nombre"])
+                with c2e:
+                    cant_e = st.number_input("Cantidad", min_value=1, value=int(enc_sel["cantidad"]))
+                    prec_e = st.number_input("Precio Unit.", min_value=0, step=1000, value=int(enc_sel["precio_unitario"]))
+                fe_e = st.text_input("Fecha Entrega", value=enc_sel["fecha_entrega"] or "")
+                obs_e = st.text_area("Observaciones", value=enc_sel["observaciones"] or "")
+                if st.form_submit_button("Actualizar Encargo"):
+                    db.update_encargo(enc_id_edit, id_enc_e, cli_e, prod_e, cant_e, prec_e, fe_e, obs_e, producto_id=enc_sel.get("producto_id"))
+                    st.success("✅ Encargo actualizado"); st.rerun()
+
+        with st.expander("🗑️ Eliminar Encargo"):
+            enc_id_del = st.selectbox("Seleccionar Encargo a Eliminar", [e["id"] for e in encargos], format_func=lambda x: f"#{x} — {next((e['cliente'] for e in encargos if e['id']==x), '')}")
+            if st.button("Eliminar encargo permanentemente", type="primary"):
+                db.delete_encargo(enc_id_del)
+                st.success("✅ Encargo eliminado"); st.rerun()
 
 # ══════════════════════════════════════════
 #  🛍️ COMPRAS
@@ -581,8 +613,9 @@ elif pagina == "📦 Insumos":
 #  💎 PRODUCTOS
 # ══════════════════════════════════════════
 elif pagina == "💎 Productos":
-    st.markdown("""<div class="main-header"><h1>💎 Gestión de <span class="accent">Productos</span></h1>
-        <p>Catálogo completo — 65 productos</p></div>""", unsafe_allow_html=True)
+    prods_count = len(db.get_productos())
+    st.markdown(f"""<div class="main-header"><h1>💎 Gestión de <span class="accent">Productos</span></h1>
+        <p>Catálogo completo — {prods_count} productos activos · Sin límite de registros</p></div>""", unsafe_allow_html=True)
 
     t1, t2, t3 = st.tabs(["📋 Catálogo", "➕ Agregar", "💰 Análisis de Costos"])
     with t1:
@@ -945,3 +978,85 @@ elif pagina == "🧮 Caja":
             if st.button("🗑️ Eliminar Movimiento", type="primary", use_container_width=True):
                 db.delete_movimiento_caja(c_id_elim)
                 st.success("✅ Movimiento eliminado correctamente"); st.rerun()
+
+# ══════════════════════════════════════════
+#  🔧 HEALTH CHECK
+# ══════════════════════════════════════════
+elif pagina == "🔧 Health Check":
+    st.markdown("""<div class="main-header" style="background: linear-gradient(135deg, #1a472a 0%, #2d5016 60%, #3a6b1e 100%);">
+        <h1>🔧 Health <span style="color:#fcee21;">Check</span></h1>
+        <p style="color:#fff;">Diagnóstico de integridad · Detección de huérfanos · Reparación automática</p>
+    </div>""", unsafe_allow_html=True)
+
+    hc = db.health_check()
+
+    # Estado general
+    if hc["total_errores"] == 0:
+        st.success(f"### {hc['estado']}\nTodas las tablas están sincronizadas correctamente.")
+    else:
+        st.error(f"### {hc['estado']}\nSe encontraron problemas que requieren atención.")
+
+    # KPIs de diagnóstico
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(f'<div class="kpi-card" style="border-left-color:#3498db;"><div class="kpi-label">Total Productos</div><div class="kpi-value">{hc["total_productos"]}</div><div class="kpi-sub">{hc["productos_activos"]} activos · Max ID: {hc["max_id_producto"]}</div></div>', unsafe_allow_html=True)
+    with c2:
+        clr = "#28a745" if len(hc["stock_negativo"]) == 0 else "#e74c3c"
+        st.markdown(f'<div class="kpi-card" style="border-left-color:{clr};"><div class="kpi-label">Stock Negativo</div><div class="kpi-value" style="color:{clr};">{len(hc["stock_negativo"])}</div><div class="kpi-sub">Productos con error</div></div>', unsafe_allow_html=True)
+    with c3:
+        orph = hc["caja_sin_venta"] + hc["caja_sin_encargo"] + hc["caja_sin_gasto"]
+        clr2 = "#28a745" if orph == 0 else "#e74c3c"
+        st.markdown(f'<div class="kpi-card" style="border-left-color:{clr2};"><div class="kpi-label">Caja Huérfana</div><div class="kpi-value" style="color:{clr2};">{orph}</div><div class="kpi-sub">Registros sin origen</div></div>', unsafe_allow_html=True)
+    with c4:
+        clr3 = "#f39c12" if hc["encargos_sin_producto_id"] > 0 else "#28a745"
+        st.markdown(f'<div class="kpi-card" style="border-left-color:{clr3};"><div class="kpi-label">Encargos sin FK</div><div class="kpi-value" style="color:{clr3};">{hc["encargos_sin_producto_id"]}</div><div class="kpi-sub">Sin producto_id vinculado</div></div>', unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Detalle de checks
+    st.markdown('<div class="section-header">📋 Detalle de Diagnóstico</div>', unsafe_allow_html=True)
+
+    checks = [
+        ("Ventas sin detalle (huérfanas)", hc["ventas_sin_detalle"], "Ventas que no tienen productos asociados"),
+        ("Detalles con producto inexistente", hc["detalles_sin_producto"], "Líneas de venta apuntando a productos eliminados"),
+        ("Ventas pagadas sin registro en Caja", hc["ventas_sin_caja"], "Ventas con pagado > 0 pero sin movimiento de caja"),
+        ("Caja → Ventas huérfanas", hc["caja_sin_venta"], "Registros de caja apuntando a ventas eliminadas"),
+        ("Caja → Encargos huérfanos", hc["caja_sin_encargo"], "Registros de caja apuntando a encargos eliminados"),
+        ("Caja → Gastos huérfanos", hc["caja_sin_gasto"], "Registros de caja apuntando a gastos eliminados"),
+    ]
+
+    for nombre, valor, desc in checks:
+        count = len(valor) if isinstance(valor, list) else valor
+        icon = "✅" if count == 0 else "❌"
+        st.markdown(f"""<div class="alert-card {'alert-critical' if count > 0 else ''}" style="display:flex; justify-content:space-between; align-items:center;">
+            <div><strong>{icon} {nombre}</strong><br><span style="font-size:0.8rem; opacity:0.7;">{desc}</span></div>
+            <div style="font-size:1.5rem; font-weight:700; color:{'#e74c3c' if count > 0 else '#28a745'};">{count}</div>
+        </div>""", unsafe_allow_html=True)
+
+    # Stock negativo detail
+    if hc["stock_negativo"]:
+        st.markdown('<div class="section-header">⚠️ Productos con Stock Negativo</div>', unsafe_allow_html=True)
+        st.dataframe(pd.DataFrame(hc["stock_negativo"]), use_container_width=True, hide_index=True)
+
+    # Repair button
+    st.markdown("---")
+    st.markdown('<div class="section-header">🔧 Reparación Automática</div>', unsafe_allow_html=True)
+    st.warning("Esta acción corregirá stock negativo (→ 0), eliminará registros huérfanos de caja, y resincronizará ventas pagadas sin entrada en caja.")
+
+    if st.button("🔧 Ejecutar Reparación Automática", type="primary", use_container_width=True):
+        reparaciones = db.reparar_integridad()
+        if reparaciones:
+            st.success(f"✅ Se realizaron {len(reparaciones)} reparaciones:")
+            for r in reparaciones:
+                st.markdown(f"- {r}")
+        else:
+            st.success("✅ No se encontraron problemas que reparar.")
+        st.rerun()
+
+    # Info about the 129 product "limit"
+    st.markdown("---")
+    st.markdown("""<div class="alert-card">
+        <strong>ℹ️ Sobre el "límite de 129 productos"</strong><br>
+        <span style="font-size:0.9rem;">El sistema usa <code>INTEGER PRIMARY KEY</code> de SQLite (64 bits), que soporta hasta <strong>9.2 quintillones</strong> de registros. 
+        No existe ningún límite de productos. Los 129 que se mostraban eran solo los productos con <code>activo = 1</code> (los eliminados se ocultan con soft-delete pero siguen en la DB).</span>
+    </div>""", unsafe_allow_html=True)

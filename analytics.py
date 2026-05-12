@@ -34,7 +34,7 @@ def get_dataframe_ventas_resumen():
 
 
 def get_dataframe_encargos():
-    encargos = db.get_encargos()
+    encargos = db.get_encargos_con_producto()
     if not encargos:
         return pd.DataFrame()
     return pd.DataFrame(encargos)

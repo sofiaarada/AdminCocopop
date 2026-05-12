@@ -80,6 +80,7 @@ def init_db():
             id_encargo TEXT NOT NULL,
             fecha DATETIME DEFAULT CURRENT_TIMESTAMP,
             cliente TEXT NOT NULL,
+            producto_id INTEGER,
             producto TEXT NOT NULL,
             cantidad INTEGER DEFAULT 1,
             precio_unitario REAL DEFAULT 0,
@@ -88,7 +89,8 @@ def init_db():
             saldo REAL DEFAULT 0,
             estado TEXT DEFAULT 'SEPARADO',
             fecha_entrega TEXT,
-            observaciones TEXT
+            observaciones TEXT,
+            FOREIGN KEY (producto_id) REFERENCES productos(id)
         );
 
         CREATE TABLE IF NOT EXISTS gastos (
@@ -124,8 +126,19 @@ def init_db():
             saldo REAL DEFAULT 0,
             estado TEXT DEFAULT 'Confirmado'
         );
+        -- Indexes for performance
+        CREATE INDEX IF NOT EXISTS idx_detalle_ventas_venta ON detalle_ventas(venta_id);
+        CREATE INDEX IF NOT EXISTS idx_detalle_ventas_producto ON detalle_ventas(producto_id);
+        CREATE INDEX IF NOT EXISTS idx_caja_origen_ref ON caja(origen, id_ref);
+        CREATE INDEX IF NOT EXISTS idx_ventas_fecha ON ventas(fecha);
+        CREATE INDEX IF NOT EXISTS idx_ventas_estado ON ventas(estado);
+        CREATE INDEX IF NOT EXISTS idx_productos_activo ON productos(activo);
+        CREATE INDEX IF NOT EXISTS idx_encargos_estado ON encargos(estado);
     """)
     conn.commit()
+    
+    # Migrate existing encargos table to add producto_id if missing
+    _migrate_encargos(conn)
     
     # Comprobar si caja está vacía pero hay ventas
     caja_count = conn.cursor().execute("SELECT COUNT(*) FROM caja").fetchone()[0]
@@ -134,6 +147,29 @@ def init_db():
         sync_historico_caja(conn)
         
     conn.close()
+
+
+def _migrate_encargos(conn):
+    """Migra tabla encargos existente: agrega producto_id si no existe y repara nombres."""
+    cursor = conn.cursor()
+    # Check if producto_id column exists
+    cols = [row[1] for row in cursor.execute("PRAGMA table_info(encargos)").fetchall()]
+    if "producto_id" not in cols:
+        cursor.execute("ALTER TABLE encargos ADD COLUMN producto_id INTEGER REFERENCES productos(id)")
+        conn.commit()
+    
+    # Auto-match existing encargos by product name
+    cursor.execute("SELECT id, producto FROM encargos WHERE producto_id IS NULL AND producto IS NOT NULL")
+    encargos_sin_id = cursor.fetchall()
+    for enc in encargos_sin_id:
+        # Try exact match first
+        match = cursor.execute("SELECT id FROM productos WHERE referencia = ? AND activo = 1", (enc["producto"],)).fetchone()
+        if not match:
+            # Try fuzzy match (LIKE)
+            match = cursor.execute("SELECT id FROM productos WHERE referencia LIKE ? AND activo = 1", (f"%{enc['producto']}%",)).fetchone()
+        if match:
+            cursor.execute("UPDATE encargos SET producto_id = ? WHERE id = ?", (match["id"], enc["id"]))
+    conn.commit()
 
 
 # =============================================
@@ -229,13 +265,6 @@ def update_insumo(insumo_id, nombre, unidad, cantidad, costo_unitario, proveedor
     conn.close()
 
 
-def update_insumo(insumo_id, nombre, unidad, cantidad, costo_unitario, proveedor, punto_pedido):
-    conn = get_connection()
-    conn.execute(
-        "UPDATE insumos SET nombre=?, unidad=?, cantidad=?, costo_unitario=?, proveedor=?, punto_pedido=? WHERE id=?",
-        (nombre, unidad, cantidad, costo_unitario, proveedor, punto_pedido, insumo_id))
-    conn.commit()
-    conn.close()
 
 
 def delete_insumo(insumo_id):
@@ -253,41 +282,46 @@ def registrar_venta(items, costo_envio=0, cliente="", tipo="VENTA", metodo_pago=
                     medio_pago="EFECTIVO", plataforma="", estado="PAGADO", notas="", orden=None, pagado_manual=None):
     conn = get_connection()
     cursor = conn.cursor()
-    subtotal = sum(item["cantidad"] * item["precio_unitario"] for item in items)
-    total = subtotal + costo_envio
-    
-    if pagado_manual is not None:
-        pagado = pagado_manual
-    else:
-        pagado = total if estado == "PAGADO" else 0
-    saldo = total - pagado
+    try:
+        subtotal = sum(item["cantidad"] * item["precio_unitario"] for item in items)
+        total = subtotal + costo_envio
+        
+        if pagado_manual is not None:
+            pagado = pagado_manual
+        else:
+            pagado = total if estado == "PAGADO" else 0
+        saldo = total - pagado
 
-    if orden is None:
-        orden = cursor.execute("SELECT COALESCE(MAX(orden), 0) FROM ventas").fetchone()[0] + 1
-    else:
-        cursor.execute("UPDATE ventas SET orden = orden + 1 WHERE orden >= ?", (orden,))
+        if orden is None:
+            orden = cursor.execute("SELECT COALESCE(MAX(orden), 0) FROM ventas").fetchone()[0] + 1
+        else:
+            cursor.execute("UPDATE ventas SET orden = orden + 1 WHERE orden >= ?", (orden,))
 
-    cursor.execute(
-        """INSERT INTO ventas (orden, cliente, tipo, metodo_pago, medio_pago, plataforma, estado,
-                               subtotal, costo_envio, total, pagado, saldo, notas)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (orden, cliente, tipo, metodo_pago, medio_pago, plataforma, estado,
-         subtotal, costo_envio, total, pagado, saldo, notas))
-    venta_id = cursor.lastrowid
-
-    for item in items:
-        item_sub = item["cantidad"] * item["precio_unitario"]
         cursor.execute(
-            "INSERT INTO detalle_ventas (venta_id, producto_id, cantidad, precio_unitario, subtotal) VALUES (?,?,?,?,?)",
-            (venta_id, item["producto_id"], item["cantidad"], item["precio_unitario"], item_sub))
-        cursor.execute("UPDATE productos SET stock = stock - ? WHERE id = ?",
-                        (item["cantidad"], item["producto_id"]))
-                        
-    if pagado > 0:
-        cursor.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES ('INGRESO', 'Venta', 'Venta', ?, ?, ?, 0, 'Confirmado')", 
-                       (venta_id, medio_pago, pagado))
-                       
-    conn.commit()
+            """INSERT INTO ventas (orden, cliente, tipo, metodo_pago, medio_pago, plataforma, estado,
+                                   subtotal, costo_envio, total, pagado, saldo, notas)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (orden, cliente, tipo, metodo_pago, medio_pago, plataforma, estado,
+             subtotal, costo_envio, total, pagado, saldo, notas))
+        venta_id = cursor.lastrowid
+
+        for item in items:
+            item_sub = item["cantidad"] * item["precio_unitario"]
+            cursor.execute(
+                "INSERT INTO detalle_ventas (venta_id, producto_id, cantidad, precio_unitario, subtotal) VALUES (?,?,?,?,?)",
+                (venta_id, item["producto_id"], item["cantidad"], item["precio_unitario"], item_sub))
+            cursor.execute("UPDATE productos SET stock = stock - ? WHERE id = ?",
+                            (item["cantidad"], item["producto_id"]))
+                            
+        if pagado > 0:
+            cursor.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES ('INGRESO', 'Venta', 'Venta', ?, ?, ?, 0, 'Confirmado')", 
+                           (venta_id, medio_pago, pagado))
+                           
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        raise e
     conn.close()
     recalcular_saldos_caja()
     return venta_id
@@ -300,67 +334,76 @@ def update_venta_info(venta_id, cliente, metodo_pago, medio_pago, plataforma, es
         return
 
     cursor = conn.cursor()
+    try:
+        if orden is not None and orden != v["orden"]:
+            exist = cursor.execute("SELECT id FROM ventas WHERE orden = ?", (orden,)).fetchone()
+            if exist:
+                cursor.execute("UPDATE ventas SET orden = orden + 1 WHERE orden >= ?", (orden,))
+        else:
+            orden = v["orden"]
 
-    if orden is not None and orden != v["orden"]:
-        exist = cursor.execute("SELECT id FROM ventas WHERE orden = ?", (orden,)).fetchone()
-        if exist:
-            cursor.execute("UPDATE ventas SET orden = orden + 1 WHERE orden >= ?", (orden,))
-    else:
-        orden = v["orden"]
+        if items is not None:
+            detalles_viejos = cursor.execute("SELECT producto_id, cantidad FROM detalle_ventas WHERE venta_id = ?", (venta_id,)).fetchall()
+            for d in detalles_viejos:
+                cursor.execute("UPDATE productos SET stock = stock + ? WHERE id = ?", (d["cantidad"], d["producto_id"]))
+            cursor.execute("DELETE FROM detalle_ventas WHERE venta_id = ?", (venta_id,))
+            
+            subtotal = sum(item["cantidad"] * item["precio_unitario"] for item in items)
+            for item in items:
+                item_sub = item["cantidad"] * item["precio_unitario"]
+                cursor.execute(
+                    "INSERT INTO detalle_ventas (venta_id, producto_id, cantidad, precio_unitario, subtotal) VALUES (?,?,?,?,?)",
+                    (venta_id, item["producto_id"], item["cantidad"], item["precio_unitario"], item_sub))
+                cursor.execute("UPDATE productos SET stock = stock - ? WHERE id = ?", (item["cantidad"], item["producto_id"]))
+        else:
+            subtotal = v["subtotal"]
 
-    if items is not None:
-        detalles_viejos = cursor.execute("SELECT producto_id, cantidad FROM detalle_ventas WHERE venta_id = ?", (venta_id,)).fetchall()
-        for d in detalles_viejos:
-            cursor.execute("UPDATE productos SET stock = stock + ? WHERE id = ?", (d["cantidad"], d["producto_id"]))
-        cursor.execute("DELETE FROM detalle_ventas WHERE venta_id = ?", (venta_id,))
-        
-        subtotal = sum(item["cantidad"] * item["precio_unitario"] for item in items)
-        for item in items:
-            item_sub = item["cantidad"] * item["precio_unitario"]
-            cursor.execute(
-                "INSERT INTO detalle_ventas (venta_id, producto_id, cantidad, precio_unitario, subtotal) VALUES (?,?,?,?,?)",
-                (venta_id, item["producto_id"], item["cantidad"], item["precio_unitario"], item_sub))
-            cursor.execute("UPDATE productos SET stock = stock - ? WHERE id = ?", (item["cantidad"], item["producto_id"]))
-    else:
-        subtotal = v["subtotal"]
+        if costo_envio is None:
+            costo_envio = v["costo_envio"]
 
-    if costo_envio is None:
-        costo_envio = v["costo_envio"]
+        total = subtotal + costo_envio
+        pagado = total if estado == "PAGADO" else v["pagado"]
+        saldo = total - pagado
 
-    total = subtotal + costo_envio
-    pagado = total if estado == "PAGADO" else v["pagado"]
-    saldo = total - pagado
+        cursor.execute(
+            """UPDATE ventas SET orden=?, cliente=?, metodo_pago=?, medio_pago=?, plataforma=?, estado=?, subtotal=?, costo_envio=?, total=?, pagado=?, saldo=?, notas=? WHERE id=?""",
+            (orden, cliente, metodo_pago, medio_pago, plataforma, estado, subtotal, costo_envio, total, pagado, saldo, notas, venta_id)
+        )
 
-    cursor.execute(
-        """UPDATE ventas SET orden=?, cliente=?, metodo_pago=?, medio_pago=?, plataforma=?, estado=?, subtotal=?, costo_envio=?, total=?, pagado=?, saldo=?, notas=? WHERE id=?""",
-        (orden, cliente, metodo_pago, medio_pago, plataforma, estado, subtotal, costo_envio, total, pagado, saldo, notas, venta_id)
-    )
+        cursor.execute("DELETE FROM caja WHERE origen = 'Venta' AND id_ref = ?", (venta_id,))
+        if pagado > 0:
+            cursor.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES ('INGRESO', 'Venta', 'Venta', ?, ?, ?, 0, 'Confirmado')", 
+                           (venta_id, medio_pago, pagado))
 
-    cursor.execute("DELETE FROM caja WHERE origen = 'Venta' AND id_ref = ?", (venta_id,))
-    if pagado > 0:
-        cursor.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES ('INGRESO', 'Venta', 'Venta', ?, ?, ?, 0, 'Confirmado')", 
-                       (venta_id, medio_pago, pagado))
-
-    conn.commit()
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        raise e
     conn.close()
     recalcular_saldos_caja()
     
 def delete_venta(venta_id):
     conn = get_connection()
     cursor = conn.cursor()
-    v = cursor.execute("SELECT orden FROM ventas WHERE id = ?", (venta_id,)).fetchone()
-    orden = v["orden"] if v else None
-    
-    detalles = cursor.execute("SELECT producto_id, cantidad FROM detalle_ventas WHERE venta_id = ?", (venta_id,)).fetchall()
-    for d in detalles:
-        cursor.execute("UPDATE productos SET stock = stock + ? WHERE id = ?", (d["cantidad"], d["producto_id"]))
-    cursor.execute("DELETE FROM ventas WHERE id = ?", (venta_id,))
-    cursor.execute("DELETE FROM caja WHERE origen = 'Venta' AND id_ref = ?", (venta_id,))
-    
-    if orden:
-        cursor.execute("UPDATE ventas SET orden = orden - 1 WHERE orden > ?", (orden,))
+    try:
+        v = cursor.execute("SELECT orden FROM ventas WHERE id = ?", (venta_id,)).fetchone()
+        orden = v["orden"] if v else None
+        
+        detalles = cursor.execute("SELECT producto_id, cantidad FROM detalle_ventas WHERE venta_id = ?", (venta_id,)).fetchall()
+        for d in detalles:
+            cursor.execute("UPDATE productos SET stock = stock + ? WHERE id = ?", (d["cantidad"], d["producto_id"]))
+        cursor.execute("DELETE FROM ventas WHERE id = ?", (venta_id,))
+        cursor.execute("DELETE FROM caja WHERE origen = 'Venta' AND id_ref = ?", (venta_id,))
+        
+        if orden:
+            cursor.execute("UPDATE ventas SET orden = orden - 1 WHERE orden > ?", (orden,))
 
-    conn.commit()
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        raise e
     conn.close()
     recalcular_saldos_caja()
 
@@ -395,9 +438,12 @@ def descontar_insumos(insumo_nombres):
     conn.close()
 
 
-def get_ventas(limite=50):
+def get_ventas(limite=None):
     conn = get_connection()
-    rows = conn.execute("SELECT * FROM ventas ORDER BY fecha DESC LIMIT ?", (limite,)).fetchall()
+    if limite:
+        rows = conn.execute("SELECT * FROM ventas ORDER BY fecha DESC LIMIT ?", (limite,)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM ventas ORDER BY fecha DESC").fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -446,25 +492,49 @@ def get_encargos(estado=None):
     return [dict(r) for r in rows]
 
 
+def get_encargos_con_producto(estado=None):
+    """Obtiene encargos con JOIN a productos para mostrar nombre real."""
+    conn = get_connection()
+    q = """SELECT e.*, 
+              COALESCE(p.referencia, e.producto) as producto_nombre,
+              p.categoria as producto_categoria
+           FROM encargos e
+           LEFT JOIN productos p ON e.producto_id = p.id"""
+    params = []
+    if estado:
+        q += " WHERE e.estado = ?"
+        params.append(estado)
+    q += " ORDER BY e.fecha DESC"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def add_encargo(id_encargo, cliente, producto, cantidad, precio_unitario, abono=0,
-                fecha_entrega="", observaciones=""):
+                fecha_entrega="", observaciones="", producto_id=None):
     total = cantidad * precio_unitario
     saldo = total - abono
     estado = "SEPARADO" if saldo > 0 else "ENTREGADO"
     conn = get_connection()
-    conn.execute(
-        """INSERT INTO encargos (id_encargo, cliente, producto, cantidad, precio_unitario,
-                                  total, abono, saldo, estado, fecha_entrega, observaciones)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-        (id_encargo, cliente, producto, cantidad, precio_unitario, total, abono, saldo, estado,
-         fecha_entrega, observaciones))
-    enc_id = conn.cursor().lastrowid
-    
-    if abono > 0:
-        conn.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES ('INGRESO', 'Abono cliente', 'Encargo', ?, 'Efectivo', ?, 0, 'Confirmado')",
-                       (enc_id, abono))
-                       
-    conn.commit()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """INSERT INTO encargos (id_encargo, cliente, producto_id, producto, cantidad, precio_unitario,
+                                      total, abono, saldo, estado, fecha_entrega, observaciones)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (id_encargo, cliente, producto_id, producto, cantidad, precio_unitario, total, abono, saldo, estado,
+             fecha_entrega, observaciones))
+        enc_id = cursor.lastrowid
+        
+        if abono > 0:
+            cursor.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES ('INGRESO', 'Abono cliente', 'Encargo', ?, 'Efectivo', ?, 0, 'Confirmado')",
+                           (enc_id, abono))
+                           
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        raise e
     conn.close()
     if abono > 0:
         recalcular_saldos_caja()
@@ -472,17 +542,23 @@ def add_encargo(id_encargo, cliente, producto, cantidad, precio_unitario, abono=
 
 def update_encargo_abono(encargo_id, nuevo_abono):
     conn = get_connection()
-    enc = conn.execute("SELECT total, abono FROM encargos WHERE id = ?", (encargo_id,)).fetchone()
-    if enc:
-        diferencia = nuevo_abono - enc["abono"]
-        saldo = enc["total"] - nuevo_abono
-        estado = "ENTREGADO" if saldo <= 0 else "SEPARADO"
-        conn.execute("UPDATE encargos SET abono=?, saldo=?, estado=? WHERE id=?",
-                      (nuevo_abono, max(saldo, 0), estado, encargo_id))
-        if diferencia > 0:
-            conn.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES ('INGRESO', 'Abono cliente', 'Encargo', ?, 'Efectivo', ?, 0, 'Confirmado')",
-                           (encargo_id, diferencia))
-    conn.commit()
+    cursor = conn.cursor()
+    try:
+        enc = cursor.execute("SELECT total, abono FROM encargos WHERE id = ?", (encargo_id,)).fetchone()
+        if enc:
+            diferencia = nuevo_abono - enc["abono"]
+            saldo = enc["total"] - nuevo_abono
+            estado = "ENTREGADO" if saldo <= 0 else "SEPARADO"
+            cursor.execute("UPDATE encargos SET abono=?, saldo=?, estado=? WHERE id=?",
+                          (nuevo_abono, max(saldo, 0), estado, encargo_id))
+            if diferencia > 0:
+                cursor.execute("INSERT INTO caja (tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES ('INGRESO', 'Abono cliente', 'Encargo', ?, 'Efectivo', ?, 0, 'Confirmado')",
+                               (encargo_id, diferencia))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        raise e
     conn.close()
     recalcular_saldos_caja()
 
@@ -494,7 +570,7 @@ def update_encargo_estado(encargo_id, estado):
     conn.close()
 
 
-def update_encargo(encargo_id, id_encargo, cliente, producto, cantidad, precio_unitario, fecha_entrega, observaciones):
+def update_encargo(encargo_id, id_encargo, cliente, producto, cantidad, precio_unitario, fecha_entrega, observaciones, producto_id=None):
     conn = get_connection()
     enc = conn.execute("SELECT abono FROM encargos WHERE id = ?", (encargo_id,)).fetchone()
     abono = enc["abono"] if enc else 0
@@ -502,8 +578,8 @@ def update_encargo(encargo_id, id_encargo, cliente, producto, cantidad, precio_u
     saldo = total - abono
     estado = "SEPARADO" if saldo > 0 else "ENTREGADO"
     conn.execute(
-        "UPDATE encargos SET id_encargo=?, cliente=?, producto=?, cantidad=?, precio_unitario=?, total=?, saldo=?, estado=?, fecha_entrega=?, observaciones=? WHERE id=?",
-        (id_encargo, cliente, producto, cantidad, precio_unitario, total, max(saldo, 0), estado, fecha_entrega, observaciones, encargo_id))
+        "UPDATE encargos SET id_encargo=?, cliente=?, producto_id=?, producto=?, cantidad=?, precio_unitario=?, total=?, saldo=?, estado=?, fecha_entrega=?, observaciones=? WHERE id=?",
+        (id_encargo, cliente, producto_id, producto, cantidad, precio_unitario, total, max(saldo, 0), estado, fecha_entrega, observaciones, encargo_id))
     conn.commit()
     conn.close()
 
@@ -515,13 +591,6 @@ def delete_encargo(encargo_id):
     conn.commit()
     conn.close()
     recalcular_saldos_caja()
-
-
-def update_encargo_estado(encargo_id, estado):
-    conn = get_connection()
-    conn.execute("UPDATE encargos SET estado = ? WHERE id = ?", (estado, encargo_id))
-    conn.commit()
-    conn.close()
 
 
 # =============================================
@@ -823,9 +892,6 @@ def cargar_datos_demo():
     conn.close()
     return True
 
-    conn.close()
-    return True
-
 
 # =============================================
 #  CRUD — CAJA
@@ -925,3 +991,97 @@ def sync_historico_caja(conn):
         cursor.execute("UPDATE caja SET saldo = ? WHERE id = ?", (saldo, r["id"]))
     
     conn.commit()
+
+
+# =============================================
+#  HEALTH CHECK — DIAGNÓSTICO DE INTEGRIDAD
+# =============================================
+
+def health_check():
+    """Ejecuta diagnóstico completo de integridad de datos. Retorna dict con resultados."""
+    conn = get_connection()
+    c = conn.cursor()
+    results = {}
+
+    # 1. Productos
+    results["total_productos"] = c.execute("SELECT COUNT(*) FROM productos").fetchone()[0]
+    results["productos_activos"] = c.execute("SELECT COUNT(*) FROM productos WHERE activo = 1").fetchone()[0]
+    results["max_id_producto"] = c.execute("SELECT MAX(id) FROM productos").fetchone()[0] or 0
+    results["stock_negativo"] = [dict(r) for r in c.execute(
+        "SELECT id, referencia, stock FROM productos WHERE stock < 0").fetchall()]
+
+    # 2. Ventas huérfanas (sin detalle)
+    results["ventas_sin_detalle"] = [r[0] for r in c.execute(
+        "SELECT v.id FROM ventas v LEFT JOIN detalle_ventas dv ON v.id = dv.venta_id WHERE dv.id IS NULL").fetchall()]
+
+    # 3. Detalles con producto inexistente
+    results["detalles_sin_producto"] = [{"detalle_id": r[0], "producto_id": r[1]} for r in c.execute(
+        "SELECT dv.id, dv.producto_id FROM detalle_ventas dv LEFT JOIN productos p ON dv.producto_id = p.id WHERE p.id IS NULL").fetchall()]
+
+    # 4. Caja huérfana
+    results["caja_sin_venta"] = len(c.execute(
+        "SELECT id FROM caja WHERE origen = 'Venta' AND id_ref NOT IN (SELECT id FROM ventas)").fetchall())
+    results["caja_sin_encargo"] = len(c.execute(
+        "SELECT id FROM caja WHERE origen = 'Encargo' AND id_ref NOT IN (SELECT id FROM encargos)").fetchall())
+    results["caja_sin_gasto"] = len(c.execute(
+        "SELECT id FROM caja WHERE origen = 'Gasto' AND id_ref NOT IN (SELECT id FROM gastos)").fetchall())
+
+    # 5. Ventas pagadas sin entrada en caja
+    results["ventas_sin_caja"] = [r[0] for r in c.execute(
+        "SELECT v.id FROM ventas v WHERE v.pagado > 0 AND v.id NOT IN (SELECT id_ref FROM caja WHERE origen = 'Venta')").fetchall()]
+
+    # 6. Encargos sin producto_id
+    results["encargos_sin_producto_id"] = len(c.execute(
+        "SELECT id FROM encargos WHERE producto_id IS NULL").fetchall())
+
+    # 7. Resumen de errores
+    total_errores = (
+        len(results["stock_negativo"]) +
+        len(results["ventas_sin_detalle"]) +
+        len(results["detalles_sin_producto"]) +
+        results["caja_sin_venta"] +
+        results["caja_sin_encargo"] +
+        results["caja_sin_gasto"] +
+        len(results["ventas_sin_caja"])
+    )
+    results["total_errores"] = total_errores
+    results["estado"] = "✅ SALUDABLE" if total_errores == 0 else f"⚠️ {total_errores} PROBLEMAS DETECTADOS"
+
+    conn.close()
+    return results
+
+
+def reparar_integridad():
+    """Repara problemas de integridad detectados por health_check."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    reparaciones = []
+
+    # 1. Corregir stock negativo → poner a 0
+    neg = cursor.execute("SELECT id, referencia, stock FROM productos WHERE stock < 0").fetchall()
+    for p in neg:
+        cursor.execute("UPDATE productos SET stock = 0 WHERE id = ?", (p["id"],))
+        reparaciones.append(f"Stock de '{p['referencia']}' corregido de {p['stock']} → 0")
+
+    # 2. Limpiar caja huérfana
+    for origen, tabla in [("Venta", "ventas"), ("Encargo", "encargos"), ("Gasto", "gastos")]:
+        deleted = cursor.execute(
+            f"DELETE FROM caja WHERE origen = ? AND id_ref NOT IN (SELECT id FROM {tabla})", (origen,)).rowcount
+        if deleted > 0:
+            reparaciones.append(f"Eliminados {deleted} registros huérfanos de caja (origen: {origen})")
+
+    # 3. Resync ventas pagadas sin caja
+    ventas_sin_caja = cursor.execute(
+        "SELECT id, fecha, medio_pago, pagado FROM ventas WHERE pagado > 0 AND id NOT IN (SELECT id_ref FROM caja WHERE origen = 'Venta')").fetchall()
+    for v in ventas_sin_caja:
+        cursor.execute("INSERT INTO caja (fecha, tipo, categoria, origen, id_ref, medio_pago, entrada, salida, estado) VALUES (?, 'INGRESO', 'Venta', 'Venta', ?, ?, ?, 0, 'Confirmado')",
+                       (v["fecha"], v["id"], v["medio_pago"], v["pagado"]))
+        reparaciones.append(f"Creado registro de caja para venta #{v['id']}")
+
+    conn.commit()
+    conn.close()
+
+    if reparaciones:
+        recalcular_saldos_caja()
+
+    return reparaciones
